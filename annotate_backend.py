@@ -1,3 +1,4 @@
+#
 import pickle
 import json
 import cv2
@@ -12,12 +13,15 @@ import sys
 import re
 import tempfile
 import io
+import subprocess
+import threading
 # from flask_mail import Mail, Message
+from threading import Thread
 from xml.dom import minidom
 from flask import Flask, jsonify, request, Response, render_template , send_from_directory, redirect, url_for, session
 from flask_cors import CORS, cross_origin
 from flask_socketio import SocketIO, emit
-# from gevent.pywsgi import WSGIServer
+from gevent.pywsgi import WSGIServer
 from PIL import Image
 from StringIO import StringIO
 from datetime import datetime, timedelta
@@ -61,13 +65,13 @@ def initData(userKey):
 	users[userKey]['videoName'] = ''
 	users[userKey]['countFrames'] = 1
 	users[userKey]['isInitTrackers'] = False
+	users[userKey]['client'] = None
 	createDir('./XMLs/' + userKey)
 
 # home
 @app.route('/', methods=['GET', 'POST'])
 @cross_origin()
 def home():
-	# global alreadyChecked
 	global users
 	return render_template('index.html'),201, {'Access-Control-Allow-Origin': '*'}
 
@@ -90,13 +94,11 @@ def login():
 @cross_origin()
 def signIn():
 	global users
-	# global alreadyChecked
 	if request.method == 'POST':
 		email = request.json['email']
 		password = request.json['pass']
 		try:
 			user = auth.sign_in_with_email_and_password(email, password)
-			# print(auth.send_email_verification(user['localId']))
 			session.permanent = True
 			return json.dumps({'success':True})
 		except:
@@ -136,7 +138,6 @@ def user():
 	else:
 		return redirect(url_for('login'))
 
-
 # track objects track
 @app.route('/track',methods = ['POST'])
 @cross_origin()
@@ -152,7 +153,6 @@ def data():
 	canvasWidth = request.json['data']['width']
 	canvasHeihgt = request.json['data']['height']
 	frame = readb64(url)
-	# cv2.imwrite('./frame.png', frame)
 	users[userKey]['frameID'] += 1
 	bboxes = []
 	if users[userKey]['count'] == 0:
@@ -225,29 +225,25 @@ def data():
 		rectForReturn[i] = rect
 	return json.dumps({'success':True, 'rects':rectForReturn, 'className':innerClasses})
 
+
 # convert hevc videos
-def convert_video(video_input, fileName):
-	# commandForCast = 'ffmpeg -i ' + video_input + ' -c:v libx264 -preset slow -x265-params crf=22 -c:a libmp3lame -b:a 128k ' + STATIC_DIR + 'c' + fileName
+def convert_video(video_input, fileName, client):
 	commandForFps = 'ffmpeg -i ' + video_input  + ' -c:v libx264 -preset medium -crf 22 -vf setpts=3*PTS -an '  + STATIC_DIR + 'c' + fileName
-	# print(video_input)
-	# cmds = ['ffmpeg', '-i', video_input, '-c:v', 'libx264', '-preset', 'slow', '-x265-params', 'crf=22', '-c:a' 'libmp3lame', '-b:a', '128k', video_output]
-	# subprocess.Popen(cmds)
-	# os.system(commandForCast)
 	# os.system(commandForFps)
-	commandForRemove = 'rm -f ' + STATIC_DIR  + fileName
-	# os.system(commandForRemove)
-	# os.system(commandForCast)
-	os.system(commandForFps)
-	os.system(commandForRemove)
+	subprocess.call(commandForFps, shell=True)
+	print(video_input)
+	# subprocess.Popen(commandForFps, shell=True, stdout=subprocess.PIPE).stdout.read()
+	commandForRemove = 'rm -f ' + video_input
+	# os.system(commandForFps)
+	# subprocess.Popen(commandForFps, shell=True, stdout=subprocess.PIPE).stdout.read()
+	subprocess.call(commandForRemove, shell=True)
+	sendMessage(client, json.dumps({'fileName':'c' + fileName}))
 
-
-#upload file /upload
+#upload videos
 @app.route('/upload', methods = ['GET', 'POST'])
 @cross_origin()
 def uploadFile():
-	global dirName
 	userKey = request.remote_addr + str(request.headers['privKey'])
-	initData(userKey)
 	try:
 		file = request.files['file']
 	except:
@@ -263,21 +259,15 @@ def uploadFile():
 	users[userKey]['trackers'] = []
 	users[userKey]['videoName'] = fileName
 	users[userKey]['originalName'] = str(file.filename)
-	# path = dirName + userKey + '/' + fileName
-	# createDir(path)
 	metaData = getVideoDetails(STATIC_DIR + fileName)
-	# print subprocess.check_output(['ls','-l'])
-	# if metaData['video']['codec'] != 'h264':
-	convert_video(STATIC_DIR + fileName, fileName)
+	thread = Thread(target = convert_video, args = (STATIC_DIR + fileName, fileName, users[userKey]['client']))
+	thread.start()
 	users[userKey]['videoName'] = 'c' + fileName
 	fileName = 'c' + fileName
 	path = dirName + userKey + '/' + fileName
 	createDir(path)
-	# return json.dumps({'fileName':False})
-	return json.dumps({'fileName':fileName, 'isCasted':True})
-	# path = dirName + userKey + '/' + fileName
-	# createDir(path)
-	# return json.dumps({'fileName':fileName, 'isCasted':False})
+	print('----------------')
+	return json.dumps({'fileName':fileName})
 
 #export files /export
 @app.route('/export/<privKey>', methods = ['GET'])
@@ -335,7 +325,22 @@ def sendMessage(message):
 	del message[0]['privKey']
 	users[userKey]['rects'] = message
 	users[userKey]['count'] = 0
-	return  json.dumps({'data':'ok'})
+	return json.dumps({'data':'ok'})
+
+#socket
+@socketio.on('connect-file')
+@cross_origin()
+def sendFile(message):
+	global users
+	userKey = request.remote_addr + message['privKey']
+	initData(userKey)
+	users[userKey]['client'] = request.sid
+	return 'ok'
+
+
+# function for send response
+def sendMessage(clientID, data):
+	socketio.emit('get-file-name', data, room=clientID)
 
 # get metadata
 def getVideoDetails(filepath):
@@ -452,7 +457,8 @@ if __name__ == '__main__':
 	#app.run(threaded=True, debug=True, ssl_context=('cert.pem', 'privkey.pem'), host='annotations-tool.instigatemobile.com', port=443) 
 	#http_server = WSGIServer(('annotations-tool.instigatemobile.com', 443), app, keyfile='privkey.pem', certfile='cert.pem')       
 	#http_server.serve_forever()
+	# http_server = WSGIServer(('172.20.16.27',7000),app)
+	# http_server.serve_forever()
 	# app.run(debug=True, threaded=True, host='172.20.16.59', port=7000)
-	#socketio.run(app, host='annotations-tool.instigatemobile.com', port=443, keyfile='privkey.pem', certfile='cert.pem')
 	socketio.run(app, host='annotations-tool.instigatemobile.com', port=443, keyfile='privkey.pem', certfile='cert.pem')
-
+	#socketio.run(app, host='172.20.16.27', port=7000)
